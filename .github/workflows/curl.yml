@@ -1,0 +1,160 @@
+name: curl
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          repository: "hellodword/curl"
+          ref: "real-curlconverter"
+          path: "curl-src"
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          repository: "emscripten-core/emsdk"
+          path: "emsdk"
+      - run: |
+          cd emsdk
+          ./emsdk install latest
+          ./emsdk activate latest
+          source ./emsdk_env.sh
+          cd ..
+
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool
+
+          cd curl-src
+          export CFLAGS="-s EXPORTED_RUNTIME_METHODS='[\"ccall\",\"callMain\",\"_free\",\"_malloc\",\"setValue\",\"UTF8ToString\",\"stringToUTF8Array\",\"lengthBytesUTF8\"]' -s IMPORTED_MEMORY "
+          autoreconf -fi
+
+          emconfigure \
+            ./configure \
+              --host wasm32 \
+              --without-brotli \
+              --without-ca \
+              --without-cuda \
+              --without-cuda-driver \
+              --without-default-ssl-backend \
+              --without-fish \
+              --without-fish-functions-dir \
+              --without-gssapi \
+              --without-hyper \
+              --without-libgsasl \
+              --without-libidn2 \
+              --without-libpsl \
+              --without-librtmp \
+              --without-libssh2 \
+              --without-libxml2 \
+              --without-nghttp2 \
+              --without-nghttp3 \
+              --without-ngtcp2 \
+              --without-ntlm \
+              --without-ntlm-auth \
+              --without-openssl \
+              --without-pic \
+              --without-quiche \
+              --without-ssl \
+              --without-zlib \
+              --without-zsh-functions-dir \
+              --without-zstd \
+              --disable-alt-svc \
+              --disable-ares \
+              --disable-auto \
+              --disable-auto-import \
+              --disable-cookies \
+              --disable-crypto \
+              --disable-crypto-auth \
+              --disable-curldebug \
+              --disable-dateparse \
+              --disable-debug \
+              --disable-dependency-tracking \
+              --disable-dict \
+              --disable-dnsshuffle \
+              --disable-doc \
+              --disable-documentation \
+              --disable-doh \
+              --disable-ech \
+              --disable-eprt \
+              --disable-epsv \
+              --disable-file \
+              --disable-ftp \
+              --disable-get \
+              --disable-get-easy-options \
+              --disable-gopher \
+              --disable-guile \
+              --disable-hsts \
+              --disable-http \
+              --disable-http-auth \
+              --disable-imap \
+              --disable-ipv6 \
+              --disable-jobserver \
+              --disable-largefile \
+              --disable-ldap \
+              --disable-ldaps \
+              --disable-libcurl \
+              --disable-libcurl-option \
+              --disable-libtool \
+              --disable-libtool-lock \
+              --disable-manual \
+              --disable-mime \
+              --disable-mqtt \
+              --disable-netrc \
+              --disable-ntlm \
+              --disable-ntlm-wb \
+              --disable-openssl \
+              --disable-openssl-auto-load-config \
+              --disable-optimize \
+              --disable-option \
+              --disable-option-checking \
+              --disable-pop3 \
+              --disable-progress \
+              --disable-progress-meter \
+              --disable-proxy \
+              --disable-rtmp \
+              --disable-rtsp \
+              --disable-scp \
+              --disable-sftp \
+              --disable-shared \
+              --disable-silent-rules \
+              --disable-smb \
+              --disable-smtp \
+              --disable-socketpair \
+              --disable-sspi \
+              --disable-symbol-hiding \
+              --disable-t \
+              --disable-telnet \
+              --disable-tftp \
+              --disable-tls \
+              --disable-tls-srp \
+              --disable-unix-sockets \
+              --disable-verbose \
+              --disable-versioned-symbols \
+              --disable-thread \
+              --disable-threaded-resolver
+          emmake make
+      - run: |
+          md5sum curl-src/src/curl
+          md5sum curl-src/src/curl.wasm
+          md5sum curl
+          md5sum curl.wasm
+      - run: |
+          export ORIGIN=$(git config --get remote.origin.url)
+          echo "${ORIGIN}"
+          mkdir pages
+          mv curl-src/src/curl pages/curl
+          mv curl-src/src/curl.wasm pages/curl.wasm
+          mv index.html pages/index.html
+          cd pages
+          git init
+          git remote add origin "${ORIGIN}"
+          git config user.email 46193371+hellodword@users.noreply.github.com
+          git config user.name hellodword
+          git add curl curl.wasm
+          git commit -m 'auto generated by github actions'
+          git branch -M pages
+          git push -u origin page

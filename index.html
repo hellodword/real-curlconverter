@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en-us">
+
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+  <title>Real Curl Converter - Powered By WebAssembly</title>
+
+</head>
+
+<body>
+  <!-- <input type="text" id="command" required minlength="4" placeholder="curl command ..." style="height: 20px;width: 80%;"
+    value='' /> -->
+
+  <textarea id="command" rows="10" style="width: 80%;"></textarea>
+  <p>
+    <input type="button" id="parse" value="Parse" disabled=true />
+  <p>
+    <textarea id="output" rows="40" style="width: 80%;"></textarea>
+
+
+    <script type='text/javascript'>
+
+      // https://github.com/rgov/node-shlex/blob/master/shlex.js
+      /*
+        Port of a subset of the features of CPython's shlex module, which provides a
+        shell-like lexer. Original code by Eric S. Raymond and other contributors.
+      */
+
+      class Shlexer {
+        constructor(string) {
+          this.i = 0
+          this.string = string
+
+          /**
+           * Characters that will be considered whitespace and skipped. Whitespace
+           * bounds tokens. By default, includes space, tab, linefeed and carriage
+           * return.
+           */
+          this.whitespace = ' \t\r\n'
+
+          /**
+           * Characters that will be considered string quotes. The token accumulates
+           * until the same quote is encountered again (thus, different quote types
+           * protect each other as in the shell.) By default, includes ASCII single
+           * and double quotes.
+           */
+          this.quotes = `'"`
+
+          /**
+           * Characters that will be considered as escape. Just `\` by default.
+           */
+          this.escapes = '\\'
+
+          /**
+           * The subset of quote types that allow escaped characters. Just `"` by default.
+           */
+          this.escapedQuotes = '"'
+
+          /**
+           * Whether to support ANSI C-style $'' quotes
+           * https://www.gnu.org/software/bash/manual/html_node/ANSI_002dC-Quoting.html
+           */
+          this.ansiCQuotes = true
+
+          /**
+           * Whether to support localized $"" quotes
+           * https://www.gnu.org/software/bash/manual/html_node/Locale-Translation.html
+           *
+           * The behavior is as if the current locale is set to C or POSIX, i.e., the
+           * contents are not translated.
+           */
+          this.localeQuotes = true
+
+          this.debug = false
+        }
+
+        readChar() {
+          return this.string.charAt(this.i++)
+        }
+
+        processEscapes(string, quote, isAnsiCQuote) {
+          if (!isAnsiCQuote && !this.escapedQuotes.includes(quote)) {
+            // This quote type doesn't support escape sequences
+            return string
+          }
+
+          // We need to form a regex that matches any of the escape characters,
+          // without interpreting any of the characters as a regex special character.
+          const anyEscape = '[' + this.escapes.replace(/(.)/g, '\\$1') + ']'
+
+          // In regular quoted strings, we can only escape an escape character, and
+          // the quote character itself.
+          if (!isAnsiCQuote && this.escapedQuotes.includes(quote)) {
+            const re = new RegExp(
+              anyEscape + '(' + anyEscape + '|\\' + quote + ')', 'g')
+            return string.replace(re, '$1')
+          }
+
+          // ANSI C quoted strings support a wide variety of escape sequences
+          if (isAnsiCQuote) {
+            const patterns = {
+              // Literal characters
+              '([\\\\\'"?])': (x) => x,
+
+              // Non-printable ASCII characters
+              'a': () => '\x07',
+              'b': () => '\x08',
+              'e|E': () => '\x1b',
+              'f': () => '\x0c',
+              'n': () => '\x0a',
+              'r': () => '\x0d',
+              't': () => '\x09',
+              'v': () => '\x0b',
+
+              // Octal bytes
+              '([0-7]{1,3})': (x) => String.fromCharCode(parseInt(x, 8)),
+
+              // Hexadecimal bytes
+              'x([0-9a-fA-F]{1,2})': (x) => String.fromCharCode(parseInt(x, 16)),
+
+              // Unicode code units
+              'u([0-9a-fA-F]{1,4})': (x) => String.fromCharCode(parseInt(x, 16)),
+              'U([0-9a-fA-F]{1,8})': (x) => String.fromCharCode(parseInt(x, 16)),
+
+              // Control characters
+              // https://en.wikipedia.org/wiki/Control_character#How_control_characters_map_to_keyboards
+              'c(.)': (x) => {
+                if (x === '?') {
+                  return '\x7f'
+                } else if (x === '@') {
+                  return '\x00'
+                } else {
+                  return String.fromCharCode(x.charCodeAt(0) & 31)
+                }
+              }
+            }
+
+            // Construct an uber-RegEx that catches all of the above pattern
+            const re = new RegExp(
+              anyEscape + '(' + Object.keys(patterns).join('|') + ')', 'g')
+
+            // For each match, figure out which subpattern matched, and apply the
+            // corresponding function
+            return string.replace(re, function (m, p1) {
+              for (const matched in patterns) {
+                const mm = new RegExp('^' + matched + '$').exec(p1)
+                if (mm === null) {
+                  continue
+                }
+
+                return patterns[matched].apply(null, mm.slice(1))
+              }
+            })
+          }
+
+          // Should not get here
+          return undefined
+        }
+
+        *[Symbol.iterator]() {
+          let inQuote = false
+          let inDollarQuote = false
+          let escaped = false
+          let lastDollar = -2 // position of last dollar sign we saw
+          let token
+
+          if (this.debug) {
+            console.log('full input:', '>' + this.string + '<')
+          }
+
+          while (true) {
+            const pos = this.i
+            const char = this.readChar()
+
+            if (this.debug) {
+              console.log(
+                'position:', pos,
+                'input:', '>' + char + '<',
+                'accumulated:', token,
+                'inQuote:', inQuote,
+                'inDollarQuote:', inDollarQuote,
+                'lastDollar:', lastDollar,
+                'escaped:', escaped
+              )
+            }
+
+            // Ran out of characters, we're done
+            if (char === '') {
+              if (inQuote) { throw new Error('Got EOF while in a quoted string') }
+              if (escaped) { throw new Error('Got EOF while in an escape sequence') }
+              if (token !== undefined) { yield token }
+              return
+            }
+
+            // We were in an escape sequence, complete it
+            if (escaped) {
+              if (char === '\n') {
+                // An escaped newline just means to continue the command on the next
+                // line. We just need to ignore it.
+              } else if (inQuote) {
+                // If we are in a quote, just accumulate the whole escape sequence,
+                // as we will interpret escape sequences later.
+                token = (token || '') + escaped + char
+              } else {
+                // Just use the literal character
+                token = (token || '') + char
+              }
+
+              escaped = false
+              continue
+            }
+
+            if (this.escapes.includes(char)) {
+              if (!inQuote || inDollarQuote !== false || this.escapedQuotes.includes(inQuote)) {
+                // We encountered an escape character, which is going to affect how
+                // we treat the next character.
+                escaped = char
+                continue
+              } else {
+                // This string type doesn't use escape characters. Ignore for now.
+              }
+            }
+
+            // We were in a string
+            if (inQuote !== false) {
+              // String is finished. Don't grab the quote character.
+              if (char === inQuote) {
+                token = this.processEscapes(token, inQuote, inDollarQuote === '\'')
+                inQuote = false
+                inDollarQuote = false
+                continue
+              }
+
+              // String isn't finished yet, accumulate the character
+              token = (token || '') + char
+              continue
+            }
+
+            // This is the start of a new string, don't accumulate the quotation mark
+            if (this.quotes.includes(char)) {
+              inQuote = char
+              if (lastDollar === pos - 1) {
+                if (char === '\'' && !this.ansiCQuotes) {
+                  // Feature not enabled
+                } else if (char === '"' && !this.localeQuotes) {
+                  // Feature not enabled
+                } else {
+                  inDollarQuote = char
+                }
+              }
+
+              token = (token || '') // fixes blank string
+
+              if (inDollarQuote !== false) {
+                // Drop the opening $ we captured before
+                token = token.slice(0, -1)
+              }
+
+              continue
+            }
+
+            // This is a dollar sign, record that we saw it in case it's the start of
+            // an ANSI C or localized string
+            if (inQuote === false && char === '$') {
+              lastDollar = pos
+            }
+
+            // This is whitespace, so yield the token if we have one
+            if (this.whitespace.includes(char)) {
+              if (token !== undefined) { yield token }
+              token = undefined
+              continue
+            }
+
+            // Otherwise, accumulate the character
+            token = (token || '') + char
+          }
+        }
+      }
+
+      function shlex(s) {
+        return Array.from(new Shlexer(s))
+      }
+
+      // https://stackoverflow.com/questions/46750777/passing-a-javascript-array-of-strings-to-a-c-function-with-emscripten
+      // convert a Javascript string to a C string
+      function str2C(s) {
+        var size = lengthBytesUTF8(s) + 1;
+        var ret = _malloc(size);
+        stringToUTF8Array(s, HEAP8, ret, size);
+        return ret;
+      }
+
+      function run_with_strings(strings) {
+        let c_strings = strings.map(x => str2C(x));
+
+
+        // allocate and populate the array. adapted from https://stackoverflow.com/a/23917034
+        let c_arr = _malloc(c_strings.length * 4); // 4-bytes per pointer
+        c_strings.forEach(function (x, i) {
+          Module.setValue(c_arr + i * 4, x, "i32");
+        });
+
+        // // https://stackoverflow.com/questions/61795187/webassembly-return-string-use-c
+        // let buflen = 10240;
+        // const buf = new Uint8Array(Module.wasmMemory.buffer, 0, buflen);
+
+        // invoke our C function
+        let rc = _parse_curl_command(c_strings.length, c_arr); // , buf.byteOffset, buflen);
+
+        // console.log(new TextDecoder('utf8').decode(buf.slice(0, rc)));
+
+        // free c_strings
+        for (let i = 0; i < c_strings.length; i++)
+          _free(c_strings[i]);
+
+        // free c_arr
+        _free(c_arr);
+
+        // return
+        return rc;
+      }
+
+      let output = document.getElementById('output');
+      let clearBtn = document.getElementById('parse');
+      let command = document.getElementById('command');
+      clearBtn.onclick = function () {
+        output.value = '';
+        if (!command.value || command.value === '') {
+          return;
+        }
+
+        console.log(encodeURIComponent(command.value));
+
+        let strings = shlex(command.value);
+        run_with_strings(strings);
+
+      }
+
+      command.value = decodeURIComponent("curl%20-L%20-k%20--location-trusted%20-X%20POST%20--post301%20--tlsv1.2%20--tls-max%201.2%20--ciphers%20ECDHE-RSA-AES128-GCM-SHA256%2CECDHE-RSA-AES256-GCM-SHA384%20%5C%0A%20%20--proxy%20%22https%3A%2F%2Fusername%3Apassword%40proxy.com%22%20--resolve%20proxy.com%3A443%3A1.2.3.4%20-u%20'username%3Apassword'%20%5C%0A%20%20--http2%20'https%3A%2F%2Fexample.com%2Furl1%3Fa%3D%22111%20222%22'%20--output%20'%2Fpath%2Fto%2Ffilename%201'%20%5C%0A%20%20-H%20'Test%20Header1%3A%20value1'%20%20-H%20'X-Requested-With%3A%20XMLHttpRequest'%20-H%20'Connection%3A%20keep-alive'%20%5C%0A%20%20--data%20'msg1%3Dwow%26msg2%3Dsuch%26msg3%3Ddata'%20--compressed%20https%3A%2F%2Fexample.com%2Furl2%20%22https%3A%2F%2Fexample.com%2Furl3%22%20%5C%0A%20%20--noproxy%20'127.0.0.1%2Clocalhost'")
+
+      let print = (function () {
+        return function (text) {
+          if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+          console.log(text);
+          if (output) {
+            output.value += text + "\n";
+            output.scrollTop = output.scrollHeight; // focus on bottom
+          }
+        };
+      })();
+
+      var Module = {
+        wasmMemory: new WebAssembly.Memory({
+          initial: 256,
+          maximum: 256,
+        }),
+        // https://stackoverflow.com/questions/63467764/assertion-failed-native-function-int-sqrt-called-before-runtime-initializatio
+        onRuntimeInitialized: function () {
+          console.log("onRuntimeInitialized");
+          clearBtn.disabled = false;
+        },
+        noInitialRun: true,
+        preRun: [],
+        postRun: [],
+        print: print,
+        printErr: print,
+        setStatus: function (text) {
+          console.warn("status", text)
+        },
+        totalDependencies: 0,
+        monitorRunDependencies: function (left) {
+        }
+      };
+      window.onerror = function (event) {
+      };
+    </script>
+    <script async type="text/javascript" src="curl"></script>
+</body>
+
+</html>
